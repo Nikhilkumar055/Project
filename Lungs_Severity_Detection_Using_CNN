@@ -1,0 +1,308 @@
+from google.colab import files
+files.upload()
+
+!mkdir -p ~/.kaggle
+!cp kaggle.json ~/.kaggle/
+!chmod 600 ~/.kaggle/kaggle.json
+
+!kaggle datasets download -d qingtaozhou/osic-pulmonaryfibrosisprogression
+
+from zipfile import ZipFile
+file_name='osic-pulmonaryfibrosisprogression.zip'
+with ZipFile(file_name,'r') as zip:
+  zip.extractall()
+  print('Done');
+
+import os
+import cv2
+
+import pydicom
+import pandas as pd
+import numpy as np 
+import tensorflow as tf 
+import matplotlib.pyplot as plt 
+from tensorflow.keras.utils import Sequence
+from tensorflow.keras import Model
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.layers import (
+    Dense, Dropout, Activation, Input, BatchNormalization, GlobalAveragePooling2D, Add, Conv2D, AveragePooling2D, 
+    LeakyReLU, Concatenate 
+)
+
+!pip install kaggle
+
+!pip install pydicom
+
+train=pd.read_csv("/content/train.csv");
+test=pd.read_csv("/content/test.csv");
+
+train.head()
+
+train = train.drop_duplicates()
+
+mean_age=np.mean(train['Age']);
+mean_age
+
+from statistics import stdev
+
+std_age=stdev(train['Age']);
+std_age
+
+def get_tab(df):
+   
+    vector = [(df.Age.values[0]-mean_age)/std_age]
+   
+    
+    if df.Sex.values[0].lower() == 'male':
+        vector.append(0)
+    else:
+        vector.append(1)
+        
+    if df.SmokingStatus.values[0] == 'Never smoked':
+        vector.extend([0,0])
+    elif df.SmokingStatus.values[0] == 'Ex-smoker':
+        vector.extend([1,1])
+    elif df.SmokingStatus.values[0] == 'Currently smokes':
+        vector.extend([0,1])
+    else:
+        vector.extend([1,0])
+        
+    return np.array(vector)
+
+A = {} #Stores slope value for each of the patient
+TAB = {} #Stores tabular data wrt each patient
+P = [] #Stores all unique patient id's
+ 
+for i, p in enumerate(train.Patient.unique()):
+    sub = train.loc[train.Patient == p, :]
+    fvc = sub.FVC.values
+    week = sub.Weeks.values
+    c = np.vstack([week, np.ones(len(week))]).T    # here we take transpose to chance dimension from (9,2) to (2,9)
+    a, b = np.linalg.lstsq(c,fvc)[0]
+    A[p] = a # Contains slope
+    TAB[p] = get_tab(sub) #Contains gender and smoking feature
+    P.append(p) #contains unique id
+
+# dc=[]
+# v=train.Patient.unique()
+# for j in os.listdir(f'/content/train/{v[0]}'):
+#     ds = pydicom.dcmread(f'/content/train/{v[0]}/{j}')
+#     plt.figure()
+#     plt.imshow(ds.pixel_array, cmap=plt.cm.bone)  # set the color map to bone
+# # plt.show()
+
+import matplotlib.pyplot as plt
+plt.xlabel("Week")
+plt.ylabel("Fvc")
+plt.plot(week,a*week+b, label='Original data')
+
+
+def get_img(path):
+    d = pydicom.dcmread(path)
+    return cv2.resize(d.pixel_array ,(512,512))
+
+class IGenerator(Sequence):
+    
+    ''' 
+    This is the generator class, which generates an input of batch size 32
+    i.e 32 patient's  and features from tabular data is generated. As output 
+    from his generator x  contains pixel_data of a dicom image, tab conatins patient's meta
+    information, and 'a' is the coeffiecient wrt each patient. 
+    '''
+    BAD_ID = ['ID00011637202177653955184', 'ID00052637202186188008618']
+    def __init__(self, keys, a, tab, batch_size=32):
+        self.keys = [k for k in keys if k not in self.BAD_ID]
+        self.a = a
+        self.tab = tab
+        self.batch_size = batch_size
+        
+        self.train_data = {}
+        for p in train.Patient.values:
+            self.train_data[p] = os.listdir(f'/content/train/{p}')
+    
+    def __len__(self):
+        return 1000
+    
+    def __getitem__(self, index):
+        x= []
+        a, tab = [], [] 
+        keys = np.random.choice(self.keys, size = self.batch_size)
+        
+        for k in keys:
+            try:
+                i = np.random.choice(self.train_data[k], size=1)[0]
+                img= get_img(f'/content/train/{k}/{i}')
+                
+                x.append(img)
+                a.append(self.a[k])
+                tab.append(self.tab[k])
+            except:
+                print(k, i)
+        
+        
+        x,a,tab = np.array(x), np.array(a), np.array(tab)
+        x = np.expand_dims(x, axis=-1)
+        return [x, tab] , a
+
+import numpy as np
+np.random.choice([1,2,3,4,5,6,7,8,9,0],5)
+
+def get_model(shape=(512, 512, 1)):
+    inp = Input(shape=shape)
+    
+    x = Conv2D(32, kernel_size=(3, 3), strides=(1, 1), padding='same')(inp)
+    x = BatchNormalization()(x)
+    x = LeakyReLU(0.05)(x)
+    
+    x = Conv2D(32, kernel_size=(3, 3), strides=(1, 1), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = LeakyReLU(0.05)(x)
+    
+    x = AveragePooling2D(pool_size=(2, 2), strides=(2, 2))(x)
+    
+ 
+    x = Conv2D(32, kernel_size=(3, 3), strides=(1, 1), padding='same')(x)
+    x = AveragePooling2D(pool_size=(2, 2), strides=(2, 2))(x)
+    
+    
+    x = Conv2D(32, kernel_size=(3, 3), strides=(1, 1), padding='same')(x)
+    x = AveragePooling2D(pool_size=(2, 2), strides=(2, 2))(x)
+    
+ 
+    x = Conv2D(32, kernel_size=(3, 3), strides=(1, 1), padding='same')(x)
+    x = AveragePooling2D(pool_size=(2, 2), strides=(2, 2))(x)
+    
+   
+    x = Conv2D(64, kernel_size=(3, 3), strides=(1, 1), padding='same')(x)
+    x = AveragePooling2D(pool_size=(2, 2), strides=(2, 2))(x)    
+ 
+    x = Conv2D(128, kernel_size=(3, 3), strides=(1, 1), padding='same')(x)
+ 
+    x = GlobalAveragePooling2D()(x)
+    
+    inp2 = Input(shape=(4,))
+    x2 = tf.keras.layers.GaussianNoise(0.2)(inp2)
+    x = Concatenate()([x, x2]) 
+    x = Dropout(0.6)(x) 
+    x = Dense(1)(x)
+    return Model([inp, inp2] , x)
+
+
+model = get_model()
+
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss='mae') 
+
+tr_p, vl_p = train_test_split(P, shuffle=True, train_size= 0.8)
+
+
+
+model.fit(IGenerator(keys=tr_p, 
+                               a = A, 
+                               tab = TAB),
+                    steps_per_epoch = 20,
+                    validation_data=IGenerator(keys=vl_p, 
+                               a = A, 
+                               tab = TAB),
+                    validation_steps = 20, 
+                    epochs=10)
+
+tf.keras.utils.plot_model(model,'img.png', show_shapes=True,dpi=40,rankdir='LB')
+
+
+
+# confidence=np.sqrt(2)*np.abs(FVC_true-FVC_pred)
+def cal_confidence(p,w,a,w_):
+        return p-a*abs(w-w_)
+        
+
+A_test, B_test, P_test,W, FVC= {}, {}, {},{},{} 
+STD, WEEK = {}, {} 
+patient_id=[]
+for p in test.Patient.unique():
+    x = [] 
+    tab = [] 
+    patient_id.append(p);
+    for i in os.listdir(f'/content/test/{p}/'):
+        x.append(get_img(f'/content/test/{p}/{i}')) 
+        tab.append(get_tab(test.loc[test.Patient == p, :])) 
+    tab = np.array(tab) 
+            
+    x = np.expand_dims(x, axis=-1) 
+    _a = model.predict([x, tab])
+    A_test[p] = np.mean(_a);
+    B_test[p] = test.FVC.values[test.Patient == p]-(A_test[p])*test.Weeks.values[test.Patient == p]
+    P_test[p] = test.Percent.values[test.Patient == p] 
+    WEEK[p] = test.Weeks.values[test.Patient == p]
+    # print(A_test[p],B_test[p]);
+    # fvc_pred = (float(A_test[p])*float(last)) +  B_test[p]
+    # print(fvc_pred);
+ 
+
+fvc1=[]
+fvc2=[]
+fvc3=[]
+confidence1=[]
+confidence2=[]
+confidence3=[]
+weeks=[]
+p=[]
+fvc=[]
+conf=[]
+for i in patient_id:
+       p.append(i);
+       p.append(i);
+       p.append(i);
+       week=train.Weeks.values[train.Patient ==i]
+       week=np.array(week);
+       last_week=week[len(week)-1]
+       second_last=week[len(week)-2]
+       third_last=week[len(week)-3]
+       weeks.append(third_last)
+       weeks.append(second_last)
+       weeks.append(last_week);
+
+       # third last 
+       fvc_pred=(float(A_test[i])*float(third_last)) +  B_test[i]
+       fvc1.append(fvc_pred);
+       fvc.append(fvc_pred);
+       fvc_true= train.FVC.values[(train.Patient ==i) & (train.Weeks ==third_last)]
+       confidence1.append(cal_confidence(P_test[i],WEEK[i],A_test[i], third_last));
+       conf.append(cal_confidence(P_test[i],WEEK[i],A_test[i], third_last));
+        # second last
+       fvc_pred=(float(A_test[i])*float(second_last)) +  B_test[i]
+       fvc2.append(fvc_pred);
+       fvc.append(fvc_pred);
+       fvc_true= train.FVC.values[(train.Patient ==i) & (train.Weeks ==second_last)]
+       confidence2.append(cal_confidence(P_test[i],WEEK[i],A_test[i], second_last));
+       conf.append(cal_confidence(P_test[i],WEEK[i],A_test[i], second_last));
+
+      # last
+       fvc_pred=(float(A_test[i])*float(last_week)) +  B_test[i]
+       fvc3.append(fvc_pred);
+       fvc.append(fvc_pred);
+       fvc_true= train.FVC.values[(train.Patient ==i) & (train.Weeks ==last_week)]
+       confidence3.append(cal_confidence(P_test[i],WEEK[i],A_test[i], last_week));
+       conf.append(cal_confidence(P_test[i],WEEK[i],A_test[i], last_week));
+
+weeks
+
+
+fvc1
+
+fvc2
+
+fvc3
+
+p
+
+confidence1
+
+confidence2
+
+confidence3
+
+dict = {'patient_id':p, 'Week': weeks, 'FVC':fvc,'Confidence':conf} 
+    
+new_df = pd.DataFrame(dict)
+
+new_df
